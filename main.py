@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
@@ -9,11 +9,12 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY", "")
+ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
 
 
 @app.get("/candles")
@@ -67,9 +68,53 @@ async def get_candles(
     }
 
 
+@app.post("/analyse")
+async def analyse(payload: dict = Body(...)):
+    """
+    Securely calls Anthropic's API on behalf of the app.
+    The app sends { system: "...", messages: [...] } — this endpoint
+    attaches the real API key (which never reaches the browser) and
+    forwards the request to Anthropic, then returns the response.
+    """
+    if not ANTHROPIC_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_KEY not set in environment")
+
+    system_prompt = payload.get("system", "")
+    messages      = payload.get("messages", [])
+    max_tokens    = payload.get("max_tokens", 3000)
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages field is required")
+
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+    }
+    body = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": messages,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(url, headers=headers, json=body)
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    return response.json()
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "key_set": bool(TWELVE_DATA_KEY)}
+    return {
+        "status": "ok",
+        "twelve_data_key_set": bool(TWELVE_DATA_KEY),
+        "anthropic_key_set": bool(ANTHROPIC_KEY),
+    }
 
 
 @app.get("/")
