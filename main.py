@@ -85,10 +85,15 @@ async def upsert_subscriber(email: str, tier: str, limit: int):
     async with httpx.AsyncClient(timeout=10.0) as client:
         if existing:
             url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{existing['id']}"
-            await client.patch(url, headers=_supabase_headers(), json=payload)
+            r = await client.patch(url, headers=_supabase_headers(), json=payload)
         else:
             url = f"{SUPABASE_URL}/rest/v1/subscribers"
-            await client.post(url, headers=_supabase_headers(), json=payload)
+            r = await client.post(url, headers={**_supabase_headers(), "Prefer": "return=representation"}, json=payload)
+
+    if r.status_code not in (200, 201, 204):
+        # Surface the real Supabase error instead of silently pretending it worked
+        raise HTTPException(status_code=502, detail=f"Supabase write failed ({r.status_code}): {r.text}")
+    return r
 
 async def deactivate_subscriber(email: str):
     existing = await get_subscriber_by_email(email)
@@ -128,8 +133,11 @@ async def lemonsqueezy_webhook(request: Request):
     if event_name in ("subscription_created", "subscription_updated", "subscription_resumed", "order_created"):
         plan = PLAN_MAP.get(variant_id)
         if plan:
-            await upsert_subscriber(email, plan["tier"], plan["limit"])
-            return {"status": "ok", "action": "upserted", "email": email, "tier": plan["tier"]}
+            try:
+                await upsert_subscriber(email, plan["tier"], plan["limit"])
+                return {"status": "ok", "action": "upserted", "email": email, "tier": plan["tier"]}
+            except HTTPException as e:
+                return {"status": "error", "detail": e.detail}
         return {"status": "ignored", "reason": f"unrecognised variant_id: {variant_id}"}
 
     if event_name in ("subscription_cancelled", "subscription_expired"):
