@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timezone
 import httpx
 import os
+import hmac
+import hashlib
 
 app = FastAPI()
 
@@ -15,14 +17,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY", "")
-ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY", "")
+TWELVE_DATA_KEY   = os.environ.get("TWELVE_DATA_KEY", "")
+ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY", "")
+SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")       # e.g. https://xxxx.supabase.co
+SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "")       # the "secret key" from Supabase API settings
+LS_WEBHOOK_SECRET = os.environ.get("LS_WEBHOOK_SECRET", "")  # signing secret from Lemon Squeezy webhook settings
+
+# Maps Lemon Squeezy product names to plan details.
+# Update these names if you ever rename the products in Lemon Squeezy.
+PLAN_MAP = {
+    "Wick Starter Package — AI Trading Analysis": {"tier": "starter", "limit": 100},
+    "Wick Pro Package — AI Trading Analysis":     {"tier": "pro",     "limit": 300},
+}
 
 # ─── Safety net: daily limit per visitor ──────────────────────────────────────
-# This is NOT a substitute for real accounts and metered billing — it's a
-# stopgap that caps the financial damage a single visitor can cause while
-# the app has no login system. Resets at midnight UTC. Adjust DAILY_LIMIT
-# as needed (20 is generous for genuine testing, low enough to block abuse).
+# Stopgap cost protection — independent of the subscriber database below.
 DAILY_LIMIT = 20
 _usage_log = defaultdict(lambda: {"date": None, "count": 0})
 
@@ -37,8 +46,111 @@ def enforce_daily_limit(request: Request):
     if entry["count"] > DAILY_LIMIT:
         raise HTTPException(
             status_code=429,
-            detail=f"Daily limit of {DAILY_LIMIT} analyses reached. This resets at midnight UTC. (This limit exists because the app has no accounts yet — it protects against runaway costs.)"
+            detail=f"Daily limit of {DAILY_LIMIT} analyses reached. Resets at midnight UTC."
         )
+
+
+# ─── Supabase helpers ──────────────────────────────────────────────────────────
+def _supabase_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+async def get_subscriber_by_email(email: str):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    url = f"{SUPABASE_URL}/rest/v1/subscribers"
+    params = {"email": f"eq.{email}", "select": "*"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=_supabase_headers(), params=params)
+    if r.status_code != 200:
+        return None
+    rows = r.json()
+    return rows[0] if rows else None
+
+async def upsert_subscriber(email: str, tier: str, limit: int):
+    existing = await get_subscriber_by_email(email)
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "email": email,
+        "tier": tier,
+        "analyses_used": 0,
+        "analyses_limit": limit,
+        "period_start": now,
+        "unlocked": True,
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        if existing:
+            url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{existing['id']}"
+            await client.patch(url, headers=_supabase_headers(), json=payload)
+        else:
+            url = f"{SUPABASE_URL}/rest/v1/subscribers"
+            await client.post(url, headers=_supabase_headers(), json=payload)
+
+async def deactivate_subscriber(email: str):
+    existing = await get_subscriber_by_email(email)
+    if not existing:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{existing['id']}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.patch(url, headers=_supabase_headers(), json={"unlocked": False})
+
+
+# ─── Lemon Squeezy webhook ─────────────────────────────────────────────────────
+@app.post("/webhook/lemonsqueezy")
+async def lemonsqueezy_webhook(request: Request):
+    """
+    Lemon Squeezy calls this automatically whenever someone subscribes,
+    cancels, or their subscription changes. We verify the signature so
+    only genuine Lemon Squeezy events can update the database, then
+    upsert the subscriber's record in Supabase.
+    """
+    raw_body = await request.body()
+    signature = request.headers.get("X-Signature", "")
+
+    if LS_WEBHOOK_SECRET:
+        expected = hmac.new(LS_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    payload = await request.json()
+    event_name = payload.get("meta", {}).get("event_name", "")
+    data = payload.get("data", {}).get("attributes", {})
+    email = data.get("user_email") or data.get("customer_email")
+    product_name = data.get("product_name", "")
+
+    if not email:
+        return {"status": "ignored", "reason": "no email in payload"}
+
+    if event_name in ("subscription_created", "subscription_updated", "subscription_resumed", "order_created"):
+        plan = PLAN_MAP.get(product_name)
+        if plan:
+            await upsert_subscriber(email, plan["tier"], plan["limit"])
+            return {"status": "ok", "action": "upserted", "email": email, "tier": plan["tier"]}
+        return {"status": "ignored", "reason": f"unrecognised product: {product_name}"}
+
+    if event_name in ("subscription_cancelled", "subscription_expired"):
+        await deactivate_subscriber(email)
+        return {"status": "ok", "action": "deactivated", "email": email}
+
+    return {"status": "ignored", "reason": f"unhandled event: {event_name}"}
+
+
+@app.get("/check-subscriber")
+async def check_subscriber(email: str = Query(...)):
+    """The app will call this to check whether an email is an active subscriber."""
+    sub = await get_subscriber_by_email(email)
+    if not sub:
+        return {"found": False}
+    return {
+        "found": True,
+        "tier": sub.get("tier"),
+        "unlocked": sub.get("unlocked"),
+        "analyses_used": sub.get("analyses_used"),
+        "analyses_limit": sub.get("analyses_limit"),
+    }
 
 
 @app.get("/candles")
@@ -74,11 +186,10 @@ async def get_candles(
     if not values:
         raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
 
-    # Convert to simple OHLCV format, oldest first
     candles = []
     for v in reversed(values):
         candles.append({
-            "t": int(__import__("datetime").datetime.fromisoformat(v["datetime"]).timestamp()),
+            "t": int(datetime.fromisoformat(v["datetime"]).timestamp()),
             "o": float(v["open"]),
             "h": float(v["high"]),
             "l": float(v["low"]),
@@ -99,9 +210,6 @@ async def get_candles(
 async def analyse(request: Request, payload: dict = Body(...)):
     """
     Securely calls Anthropic's API on behalf of the app.
-    The app sends { system: "...", messages: [...] } — this endpoint
-    attaches the real API key (which never reaches the browser) and
-    forwards the request to Anthropic, then returns the response.
     """
     enforce_daily_limit(request)
 
@@ -151,9 +259,11 @@ async def health():
         "status": "ok",
         "twelve_data_key_set": bool(TWELVE_DATA_KEY),
         "anthropic_key_set": bool(ANTHROPIC_KEY),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+        "ls_webhook_secret_set": bool(LS_WEBHOOK_SECRET),
     }
 
 
 @app.get("/")
 async def root():
-    return {"service": "Wick market data proxy", "endpoints": ["/candles", "/health"]}
+    return {"service": "Wick market data proxy", "endpoints": ["/candles", "/analyse", "/webhook/lemonsqueezy", "/check-subscriber", "/health"]}
