@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 import httpx
 import os
 import hmac
@@ -102,6 +102,55 @@ async def deactivate_subscriber(email: str):
     url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{existing['id']}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.patch(url, headers=_supabase_headers(), json={"unlocked": False})
+
+
+async def patch_subscriber(sub_id, fields):
+    url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{sub_id}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.patch(url, headers=_supabase_headers(), json=fields)
+    return r
+
+async def check_and_increment_usage(email: str):
+    """
+    Called before every paid analysis. Enforces the subscriber's real
+    monthly limit (100 for Starter, 300 for Pro) and resets usage
+    automatically once 30 days have passed since their period started —
+    no manual housekeeping or scheduled job needed.
+    """
+    sub = await get_subscriber_by_email(email)
+    if not sub:
+        raise HTTPException(status_code=404, detail="No active subscription found for that email.")
+    if not sub.get("unlocked"):
+        raise HTTPException(status_code=403, detail="This subscription is no longer active.")
+
+    used  = sub.get("analyses_used", 0)
+    limit = sub.get("analyses_limit", 100)
+    tier  = sub.get("tier", "starter")
+
+    # Automatic monthly reset — lazy-checked on use, so no cron job is needed.
+    period_start_raw = sub.get("period_start")
+    if period_start_raw:
+        try:
+            period_start = datetime.fromisoformat(period_start_raw.replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - period_start > timedelta(days=30):
+                used = 0
+                await patch_subscriber(sub["id"], {
+                    "analyses_used": 0,
+                    "period_start": datetime.now(timezone.utc).isoformat(),
+                })
+        except (ValueError, TypeError):
+            pass  # if the date is malformed, skip the reset rather than block usage
+
+    if used >= limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've used all {limit} analyses included in your {tier.capitalize()} plan this month. "
+                   f"It resets automatically next billing period, or upgrade for a higher limit."
+        )
+
+    new_used = used + 1
+    await patch_subscriber(sub["id"], {"analyses_used": new_used})
+    return {"analyses_used": new_used, "analyses_limit": limit, "tier": tier}
 
 
 # ─── Lemon Squeezy webhook ─────────────────────────────────────────────────────
@@ -219,8 +268,18 @@ async def get_candles(
 async def analyse(request: Request, payload: dict = Body(...)):
     """
     Securely calls Anthropic's API on behalf of the app.
+    If the request includes a subscriber email, it's checked and metered
+    against their real plan limit (100 Starter / 300 Pro) with automatic
+    monthly reset. If no email is present, the free-tier daily IP limit
+    is the only protection — unchanged from before.
     """
-    enforce_daily_limit(request)
+    email = payload.get("email")
+    usage_info = None
+
+    if email:
+        usage_info = await check_and_increment_usage(email)
+    else:
+        enforce_daily_limit(request)
 
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="ANTHROPIC_KEY not set in environment")
@@ -251,7 +310,10 @@ async def analyse(request: Request, payload: dict = Body(...)):
     if response.status_code != 200:
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
-    return response.json()
+    result = response.json()
+    if usage_info:
+        result["_usage"] = usage_info  # lets the app update its local usage display
+    return result
 
 
 @app.get("/usage")
