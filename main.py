@@ -23,11 +23,12 @@ SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")       # e.g. https://xxxx
 SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "")       # the "secret key" from Supabase API settings
 LS_WEBHOOK_SECRET = os.environ.get("LS_WEBHOOK_SECRET", "")  # signing secret from Lemon Squeezy webhook settings
 
-# Maps Lemon Squeezy product names to plan details.
-# Update these names if you ever rename the products in Lemon Squeezy.
+# Maps Lemon Squeezy variant IDs to plan details. Variant IDs are stable
+# numbers that never change, unlike product name text (which can have
+# inconsistent spacing and broke our matching before).
 PLAN_MAP = {
-    "Wick Starter Package — AI Trading Analysis": {"tier": "starter", "limit": 100},
-    "Wick Pro Package — AI Trading Analysis":     {"tier": "pro",     "limit": 300},
+    1831416: {"tier": "starter", "limit": 100},  # Wick Starter
+    1831445: {"tier": "pro",     "limit": 300},  # Wick Pro
 }
 
 # ─── Safety net: daily limit per visitor ──────────────────────────────────────
@@ -119,17 +120,17 @@ async def lemonsqueezy_webhook(request: Request):
     event_name = payload.get("meta", {}).get("event_name", "")
     data = payload.get("data", {}).get("attributes", {})
     email = data.get("user_email") or data.get("customer_email")
-    product_name = data.get("product_name", "")
+    variant_id = data.get("variant_id")
 
     if not email:
         return {"status": "ignored", "reason": "no email in payload"}
 
     if event_name in ("subscription_created", "subscription_updated", "subscription_resumed", "order_created"):
-        plan = PLAN_MAP.get(product_name)
+        plan = PLAN_MAP.get(variant_id)
         if plan:
             await upsert_subscriber(email, plan["tier"], plan["limit"])
             return {"status": "ok", "action": "upserted", "email": email, "tier": plan["tier"]}
-        return {"status": "ignored", "reason": f"unrecognised product: {product_name}"}
+        return {"status": "ignored", "reason": f"unrecognised variant_id: {variant_id}"}
 
     if event_name in ("subscription_cancelled", "subscription_expired"):
         await deactivate_subscriber(email)
