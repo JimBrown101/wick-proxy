@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Body, Request
+from fastapi import FastAPI, HTTPException, Query, Body, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from collections import defaultdict
 from datetime import date, datetime, timezone, timedelta
@@ -323,6 +323,10 @@ async def usage():
     today_usage = {ip: v["count"] for ip, v in _usage_log.items() if v["date"] == today}
     return {"date": today, "daily_limit": DAILY_LIMIT, "usage_by_ip": today_usage}
 
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
 
 @app.get("/health")
 async def health():
