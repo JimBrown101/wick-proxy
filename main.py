@@ -178,7 +178,7 @@ async def whop_webhook(request: Request):
     if not email:
         return {"status": "ignored", "reason": "no email in payload"}
 
-    if action in ("membership.went_valid", "membership.created", "payment.succeeded"):
+    if action in ("membership.went_valid", "membership.created", "membership_activated", "payment.succeeded", "payment_succeeded"):
         plan = PLAN_MAP.get(product_slug)
         if not plan:
             for key in PLAN_MAP:
@@ -193,7 +193,7 @@ async def whop_webhook(request: Request):
                 return {"status": "error", "detail": e.detail}
         return {"status": "ignored", "reason": f"unrecognised product: {product_slug}"}
 
-    if action in ("membership.went_invalid", "membership.cancelled", "membership.expired"):
+    if action in ("membership.went_invalid", "membership.cancelled", "membership.expired", "membership_deactivated", "membership_cancel_at_period_end_chan"):
         await deactivate_subscriber(email)
         return {"status": "ok", "action": "deactivated", "email": email}
 
