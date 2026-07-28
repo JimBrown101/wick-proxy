@@ -23,10 +23,15 @@ SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")       # e.g. https://xxxx
 SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "")       # the "secret key" from Supabase API settings
 WHOP_API_KEY = os.environ.get("WHOP_API_KEY", "")  # signing secret from Whop webhook settings
 
-# Maps Whop product slugs to plan details
+# Maps Whop product identifiers to plan details.
+# Includes product IDs (most reliable), slugs and title fallbacks.
 PLAN_MAP = {
-    "wick-starter": {"tier": "starter", "limit": 100},
-    "wick-pro":     {"tier": "pro",     "limit": 300},
+    "prod_QziWZaoMPPzhr": {"tier": "starter", "limit": 100},  # Wick Starter
+    "prod_U4MBsuhmSRXQp": {"tier": "pro",     "limit": 300},  # Wick Pro
+    "wick-starter":        {"tier": "starter", "limit": 100},  # slug fallback
+    "wick-pro":            {"tier": "pro",     "limit": 300},  # slug fallback
+    "wick starter":        {"tier": "starter", "limit": 100},  # title fallback
+    "wick pro":            {"tier": "pro",     "limit": 300},  # title fallback
 }
 
 # ─── Safety net: daily limit per visitor ──────────────────────────────────────
@@ -156,7 +161,16 @@ async def check_and_increment_usage(email: str):
 async def whop_webhook(request: Request):
     """
     Whop calls this when someone subscribes, cancels or their membership
-    changes. We verify the signature then update Supabase accordingly.
+    changes. Payload structure per Whop API v1 docs:
+    {
+      "action": "membership.went_valid",
+      "data": {
+        "email": "user@example.com",          # top-level email
+        "user": { "email": "...", "id": "..." },
+        "product": { "id": "prod_xxx", "title": "Wick Starter" },
+        "plan": { "id": "plan_xxx" }
+      }
+    }
     """
     raw_body = await request.body()
     signature = request.headers.get("X-Whop-Signature", "")
@@ -167,33 +181,47 @@ async def whop_webhook(request: Request):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     payload = await request.json()
-    action  = payload.get("action", "")
+    action  = payload.get("action", "") or payload.get("type", "")
     data    = payload.get("data", {})
-    email   = data.get("email") or data.get("user_email")
-    product = data.get("product_id") or data.get("plan_id") or ""
 
-    # Normalise product slug
-    product_slug = product.split("/")[-1].replace("_", "-").lower()
+    # Email — try multiple locations Whop may use
+    email = (
+        data.get("email") or
+        (data.get("user") or {}).get("email") or
+        data.get("user_email")
+    )
+
+    # Product identification — try product title and ID
+    product_obj   = data.get("product") or {}
+    product_title = (product_obj.get("title") or "").lower()
+    product_id    = product_obj.get("id") or ""
+    plan_id       = (data.get("plan") or {}).get("id") or ""
 
     if not email:
-        return {"status": "ignored", "reason": "no email in payload"}
+        return {"status": "ignored", "reason": "no email in payload", "action": action}
 
-    if action in ("membership.went_valid", "membership.created", "membership_activated", "payment.succeeded", "payment_succeeded"):
-        plan = PLAN_MAP.get(product_slug)
+    if action in ("membership.went_valid", "membership.created", "membership_activated",
+                  "membership.activated", "payment.succeeded", "payment_succeeded"):
+
+        # Match by product ID first (most reliable), then title
+        plan = PLAN_MAP.get(product_id) or PLAN_MAP.get(plan_id)
         if not plan:
-            for key in PLAN_MAP:
-                if key in product_slug:
-                    plan = PLAN_MAP[key]
-                    break
+            # Fall back to title matching
+            if "starter" in product_title:
+                plan = PLAN_MAP["wick-starter"]
+            elif "pro" in product_title:
+                plan = PLAN_MAP["wick-pro"]
+
         if plan:
             try:
                 await upsert_subscriber(email, plan["tier"], plan["limit"])
                 return {"status": "ok", "action": "upserted", "email": email, "tier": plan["tier"]}
             except HTTPException as e:
                 return {"status": "error", "detail": e.detail}
-        return {"status": "ignored", "reason": f"unrecognised product: {product_slug}"}
+        return {"status": "ignored", "reason": f"unrecognised product: {product_title or product_id}", "action": action}
 
-    if action in ("membership.went_invalid", "membership.cancelled", "membership.expired", "membership_deactivated", "membership_cancel_at_period_end_chan"):
+    if action in ("membership.went_invalid", "membership.cancelled", "membership.expired",
+                  "membership_deactivated", "membership.deactivated", "membership_cancel_at_period_end_chan"):
         await deactivate_subscriber(email)
         return {"status": "ok", "action": "deactivated", "email": email}
 
