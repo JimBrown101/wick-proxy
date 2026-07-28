@@ -21,14 +21,12 @@ TWELVE_DATA_KEY   = os.environ.get("TWELVE_DATA_KEY", "")
 ANTHROPIC_KEY     = os.environ.get("ANTHROPIC_KEY", "")
 SUPABASE_URL      = os.environ.get("SUPABASE_URL", "")       # e.g. https://xxxx.supabase.co
 SUPABASE_KEY      = os.environ.get("SUPABASE_KEY", "")       # the "secret key" from Supabase API settings
-LS_WEBHOOK_SECRET = os.environ.get("LS_WEBHOOK_SECRET", "")  # signing secret from Lemon Squeezy webhook settings
+WHOP_API_KEY = os.environ.get("WHOP_API_KEY", "")  # signing secret from Whop webhook settings
 
-# Maps Lemon Squeezy variant IDs to plan details. Variant IDs are stable
-# numbers that never change, unlike product name text (which can have
-# inconsistent spacing and broke our matching before).
+# Maps Whop product slugs to plan details
 PLAN_MAP = {
-    1831416: {"tier": "starter", "limit": 100},  # Wick Starter
-    1831445: {"tier": "pro",     "limit": 300},  # Wick Pro
+    "wick-starter": {"tier": "starter", "limit": 100},
+    "wick-pro":     {"tier": "pro",     "limit": 300},
 }
 
 # ─── Safety net: daily limit per visitor ──────────────────────────────────────
@@ -153,47 +151,53 @@ async def check_and_increment_usage(email: str):
     return {"analyses_used": new_used, "analyses_limit": limit, "tier": tier}
 
 
-# ─── Lemon Squeezy webhook ─────────────────────────────────────────────────────
-@app.post("/webhook/lemonsqueezy")
-async def lemonsqueezy_webhook(request: Request):
+# ─── Whop webhook ──────────────────────────────────────────────────────────────
+@app.post("/webhook/whop")
+async def whop_webhook(request: Request):
     """
-    Lemon Squeezy calls this automatically whenever someone subscribes,
-    cancels, or their subscription changes. We verify the signature so
-    only genuine Lemon Squeezy events can update the database, then
-    upsert the subscriber's record in Supabase.
+    Whop calls this when someone subscribes, cancels or their membership
+    changes. We verify the signature then update Supabase accordingly.
     """
     raw_body = await request.body()
-    signature = request.headers.get("X-Signature", "")
+    signature = request.headers.get("X-Whop-Signature", "")
 
-    if LS_WEBHOOK_SECRET:
-        expected = hmac.new(LS_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    if WHOP_API_KEY and signature:
+        expected = hmac.new(WHOP_API_KEY.encode(), raw_body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, signature):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     payload = await request.json()
-    event_name = payload.get("meta", {}).get("event_name", "")
-    data = payload.get("data", {}).get("attributes", {})
-    email = data.get("user_email") or data.get("customer_email")
-    variant_id = data.get("variant_id")
+    action  = payload.get("action", "")
+    data    = payload.get("data", {})
+    email   = data.get("email") or data.get("user_email")
+    product = data.get("product_id") or data.get("plan_id") or ""
+
+    # Normalise product slug
+    product_slug = product.split("/")[-1].replace("_", "-").lower()
 
     if not email:
         return {"status": "ignored", "reason": "no email in payload"}
 
-    if event_name in ("subscription_created", "subscription_updated", "subscription_resumed", "order_created"):
-        plan = PLAN_MAP.get(variant_id)
+    if action in ("membership.went_valid", "membership.created", "payment.succeeded"):
+        plan = PLAN_MAP.get(product_slug)
+        if not plan:
+            for key in PLAN_MAP:
+                if key in product_slug:
+                    plan = PLAN_MAP[key]
+                    break
         if plan:
             try:
                 await upsert_subscriber(email, plan["tier"], plan["limit"])
                 return {"status": "ok", "action": "upserted", "email": email, "tier": plan["tier"]}
             except HTTPException as e:
                 return {"status": "error", "detail": e.detail}
-        return {"status": "ignored", "reason": f"unrecognised variant_id: {variant_id}"}
+        return {"status": "ignored", "reason": f"unrecognised product: {product_slug}"}
 
-    if event_name in ("subscription_cancelled", "subscription_expired"):
+    if action in ("membership.went_invalid", "membership.cancelled", "membership.expired"):
         await deactivate_subscriber(email)
         return {"status": "ok", "action": "deactivated", "email": email}
 
-    return {"status": "ignored", "reason": f"unhandled event: {event_name}"}
+    return {"status": "ignored", "reason": f"unhandled action: {action}"}
 
 
 @app.get("/check-subscriber")
@@ -335,10 +339,10 @@ async def health():
         "twelve_data_key_set": bool(TWELVE_DATA_KEY),
         "anthropic_key_set": bool(ANTHROPIC_KEY),
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
-        "ls_webhook_secret_set": bool(LS_WEBHOOK_SECRET),
+        "whop_webhook_secret_set": bool(WHOP_API_KEY),
     }
 
 
 @app.get("/")
 async def root():
-    return {"service": "Wick market data proxy", "endpoints": ["/candles", "/analyse", "/webhook/lemonsqueezy", "/check-subscriber", "/health"]}
+    return {"service": "Wick market data proxy", "endpoints": ["/candles", "/analyse", "/webhook/whop", "/check-subscriber", "/health"]}
