@@ -343,8 +343,15 @@ async def analyse(request: Request, payload: dict = Body(...)):
         raise HTTPException(status_code=response.status_code, detail=response.text)
 
     result = response.json()
+
+    # Sonnet 5 uses adaptive thinking which adds 'thinking' content blocks.
+    # Strip these out server-side so the client only receives clean text blocks
+    # and our JSON parsing never fails on thinking output.
+    if "content" in result:
+        result["content"] = [b for b in result["content"] if b.get("type") != "thinking"]
+
     if usage_info:
-        result["_usage"] = usage_info  # lets the app update its local usage display
+        result["_usage"] = usage_info
     return result
 
 
