@@ -330,7 +330,7 @@ async def analyse(request: Request, payload: dict = Body(...)):
         "anthropic-version": "2023-06-01",
     }
     body = {
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-4-5",
         "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": messages,
