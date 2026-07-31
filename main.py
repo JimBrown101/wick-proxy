@@ -309,7 +309,13 @@ async def analyse(request: Request, payload: dict = Body(...)):
     usage_info = None
 
     if email:
-        usage_info = await check_and_increment_usage(email)
+        try:
+            usage_info = await check_and_increment_usage(email)
+        except HTTPException:
+            raise  # re-raise limit/auth errors as-is
+        except Exception as e:
+            # Supabase connection issue — log it but don't block the analysis
+            print(f"Usage check failed for {email}: {e}")
     else:
         enforce_daily_limit(request)
 
