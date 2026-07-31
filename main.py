@@ -87,28 +87,24 @@ async def upsert_subscriber(email: str, tier: str, limit: int):
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         if existing:
-            url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{existing['id']}"
+            url = f"{SUPABASE_URL}/rest/v1/subscribers?email=eq.{email}"
             r = await client.patch(url, headers=_supabase_headers(), json=payload)
         else:
             url = f"{SUPABASE_URL}/rest/v1/subscribers"
             r = await client.post(url, headers={**_supabase_headers(), "Prefer": "return=representation"}, json=payload)
 
     if r.status_code not in (200, 201, 204):
-        # Surface the real Supabase error instead of silently pretending it worked
         raise HTTPException(status_code=502, detail=f"Supabase write failed ({r.status_code}): {r.text}")
     return r
 
 async def deactivate_subscriber(email: str):
-    existing = await get_subscriber_by_email(email)
-    if not existing:
-        return
-    url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{existing['id']}"
+    url = f"{SUPABASE_URL}/rest/v1/subscribers?email=eq.{email}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.patch(url, headers=_supabase_headers(), json={"unlocked": False})
 
 
-async def patch_subscriber(sub_id, fields):
-    url = f"{SUPABASE_URL}/rest/v1/subscribers?id=eq.{sub_id}"
+async def patch_subscriber(email: str, fields: dict):
+    url = f"{SUPABASE_URL}/rest/v1/subscribers?email=eq.{email}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.patch(url, headers=_supabase_headers(), json=fields)
     return r
@@ -137,7 +133,7 @@ async def check_and_increment_usage(email: str):
             period_start = datetime.fromisoformat(period_start_raw.replace("Z", "+00:00"))
             if datetime.now(timezone.utc) - period_start > timedelta(days=30):
                 used = 0
-                await patch_subscriber(sub["id"], {
+                await patch_subscriber(email, {
                     "analyses_used": 0,
                     "period_start": datetime.now(timezone.utc).isoformat(),
                 })
@@ -152,7 +148,7 @@ async def check_and_increment_usage(email: str):
         )
 
     new_used = used + 1
-    await patch_subscriber(sub["id"], {"analyses_used": new_used})
+    await patch_subscriber(email, {"analyses_used": new_used})
     return {"analyses_used": new_used, "analyses_limit": limit, "tier": tier}
 
 
