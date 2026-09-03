@@ -13,8 +13,9 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
 TWELVE_DATA_KEY   = os.environ.get("TWELVE_DATA_KEY", "")
