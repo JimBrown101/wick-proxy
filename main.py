@@ -339,7 +339,7 @@ async def analyse(request: Request, payload: dict = Body(...)):
         "messages": messages,
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(url, headers=headers, json=body)
 
     if response.status_code != 200:
